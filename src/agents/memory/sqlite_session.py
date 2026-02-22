@@ -212,44 +212,77 @@ class SQLiteSession(SessionABC):
 
         await asyncio.to_thread(_add_items_sync)
 
+    def _get_item_unlocked(self, conn: sqlite3.Connection) -> TResponseInputItem | None:
+        """Remove and return the most recent item WITHOUT acquiring self._lock.
+
+        This method performs the pop operation directly on the provided connection
+        without acquiring ``self._lock``.  It **must** only be called by a caller
+        that already holds ``self._lock`` (or that does not require locking, e.g.
+        a file-db path where a fresh ``threading.Lock()`` is used per call).
+
+        Separating the lock-free implementation prevents a classic re-entrant
+        deadlock: ``threading.Lock`` is **not** reentrant, so any code path where
+        ``pop_item()`` held ``self._lock`` and then called another method (e.g.
+        ``get_items()``) that also tried to acquire ``self._lock`` would block
+        forever.  By delegating the database work here, ``pop_item()`` can safely
+        acquire the lock exactly once and hand the open connection down without
+        risking a second acquisition.
+
+        Args:
+            conn: An active SQLite connection to use for the operation.
+
+        Returns:
+            The most recent item if the session is non-empty, ``None`` otherwise.
+            Also returns ``None`` if the stored JSON is corrupt (the row is still
+            deleted in that case, which matches the pre-existing behaviour).
+        """
+        # Use DELETE … RETURNING to atomically remove and surface the row.
+        cursor = conn.execute(
+            f"""
+            DELETE FROM {self.messages_table}
+            WHERE id = (
+                SELECT id FROM {self.messages_table}
+                WHERE session_id = ?
+                ORDER BY id DESC
+                LIMIT 1
+            )
+            RETURNING message_data
+            """,
+            (self.session_id,),
+        )
+
+        result = cursor.fetchone()
+        conn.commit()
+
+        if result:
+            message_data = result[0]
+            try:
+                return json.loads(message_data)  # type: ignore[return-value]
+            except json.JSONDecodeError:
+                # Return None for corrupted JSON entries (already deleted)
+                return None
+
+        return None
+
     async def pop_item(self) -> TResponseInputItem | None:
         """Remove and return the most recent item from the session.
 
+        Acquires ``self._lock`` (for in-memory databases) and delegates the
+        actual database work to :meth:`_get_item_unlocked`, which does **not**
+        re-acquire the lock.
+
+        This two-layer design prevents a deadlock that would occur if
+        ``pop_item()`` held ``self._lock`` and then called any helper that also
+        tried to acquire it — ``threading.Lock`` is not reentrant.
+
         Returns:
-            The most recent item if it exists, None if the session is empty
+            The most recent item if it exists, ``None`` if the session is empty.
         """
 
-        def _pop_item_sync():
+        def _pop_item_sync() -> TResponseInputItem | None:
             conn = self._get_connection()
             with self._lock if self._is_memory_db else threading.Lock():
-                # Use DELETE with RETURNING to atomically delete and return the most recent item
-                cursor = conn.execute(
-                    f"""
-                    DELETE FROM {self.messages_table}
-                    WHERE id = (
-                        SELECT id FROM {self.messages_table}
-                        WHERE session_id = ?
-                        ORDER BY id DESC
-                        LIMIT 1
-                    )
-                    RETURNING message_data
-                    """,
-                    (self.session_id,),
-                )
-
-                result = cursor.fetchone()
-                conn.commit()
-
-                if result:
-                    message_data = result[0]
-                    try:
-                        item = json.loads(message_data)
-                        return item
-                    except json.JSONDecodeError:
-                        # Return None for corrupted JSON entries (already deleted)
-                        return None
-
-                return None
+                return self._get_item_unlocked(conn)
 
         return await asyncio.to_thread(_pop_item_sync)
 
